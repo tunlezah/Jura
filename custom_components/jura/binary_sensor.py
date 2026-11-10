@@ -1,142 +1,138 @@
-import logging
+"""Binary sensor platform for the JURA Coffee Machines integration."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import override
 
 from homeassistant.components.binary_sensor import (
     BinarySensorDeviceClass,
     BinarySensorEntity,
+    BinarySensorEntityDescription,
 )
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from . import DOMAIN
-from .core.entity import JuraEntity
+from .coordinator import JuraConfigEntry, JuraCoordinator
+from .entity import JuraCoordinatorEntity, JuraEntity
 
-_LOGGER = logging.getLogger(__name__)
+# Coordinator is used to centralize the data updates
+PARALLEL_UPDATES = 0
 
-# Define alert sensors with their expected alert names and configurations
-ALERT_SENSORS = [
+
+@dataclass(frozen=True, kw_only=True)
+class JuraAlertBinarySensorDescription(BinarySensorEntityDescription):
+    """Describe an alert of the machine."""
+
+    # the sensor is on if the name of an active alert contains the pattern
+    name_pattern: str
+
+
+# The keys are part of the unique IDs, don't change them
+ALERT_SENSORS: tuple[JuraAlertBinarySensorDescription, ...] = (
     # Maintenance alerts (these are normal maintenance operations)
-    {
-        "name_pattern": "insert tray",
-        "type": "insert_tray",
-        "display_name": "Insert Tray",
-        "icon": "mdi:tray",
-        "device_class": BinarySensorDeviceClass.PROBLEM,
-        "entity_category": EntityCategory.DIAGNOSTIC,
-    },
-    {
-        "name_pattern": "fill water",
-        "type": "fill_water",
-        "display_name": "Fill Water",
-        "icon": "mdi:water",
-        "device_class": BinarySensorDeviceClass.PROBLEM,
-        "entity_category": EntityCategory.DIAGNOSTIC,
-    },
-    {
-        "name_pattern": "empty grounds",
-        "type": "empty_grounds",
-        "display_name": "Empty Grounds",
-        "icon": "mdi:delete",
-        "device_class": BinarySensorDeviceClass.PROBLEM,
-        "entity_category": EntityCategory.DIAGNOSTIC,
-    },
-    {
-        "name_pattern": "empty tray",
-        "type": "empty_tray",
-        "display_name": "Empty Tray",
-        "icon": "mdi:tray-alert",
-        "device_class": BinarySensorDeviceClass.PROBLEM,
-        "entity_category": EntityCategory.DIAGNOSTIC,
-    },
+    JuraAlertBinarySensorDescription(
+        key="insert_tray",
+        translation_key="insert_tray",
+        name_pattern="insert tray",
+    ),
+    JuraAlertBinarySensorDescription(
+        key="fill_water",
+        translation_key="fill_water",
+        name_pattern="fill water",
+    ),
+    JuraAlertBinarySensorDescription(
+        key="empty_grounds",
+        translation_key="empty_grounds",
+        name_pattern="empty grounds",
+    ),
+    JuraAlertBinarySensorDescription(
+        key="empty_tray",
+        translation_key="empty_tray",
+        name_pattern="empty tray",
+    ),
     # Service alerts (require cleaning or filter replacement)
-    {
-        "name_pattern": "cleaning alert",
-        "type": "cleaning_alert",
-        "display_name": "Cleaning Needed",
-        "icon": "mdi:washing-machine",
-        "device_class": BinarySensorDeviceClass.PROBLEM,
-        "entity_category": EntityCategory.DIAGNOSTIC,
-    },
-    {
-        "name_pattern": "filter alert",
-        "type": "filter_alert",
-        "display_name": "Filter Change Needed",
-        "icon": "mdi:air-filter",
-        "device_class": BinarySensorDeviceClass.PROBLEM,
-        "entity_category": EntityCategory.DIAGNOSTIC,
-    },
-    {
-        "name_pattern": "cappu rinse alert",
-        "type": "cappu_rinse_alert",
-        "display_name": "Milk System Rinse Needed",
-        "icon": "mdi:cup-water",
-        "device_class": BinarySensorDeviceClass.PROBLEM,
-        "entity_category": EntityCategory.DIAGNOSTIC,
-    },
-    {
-        "name_pattern": "cappu clean alert",
-        "type": "cappu_clean_alert",
-        "display_name": "Milk System Cleaning Needed",
-        "icon": "mdi:cup-water",
-        "device_class": BinarySensorDeviceClass.PROBLEM,
-        "entity_category": EntityCategory.DIAGNOSTIC,
-    },
-]
+    JuraAlertBinarySensorDescription(
+        key="cleaning_alert",
+        translation_key="cleaning_alert",
+        name_pattern="cleaning alert",
+    ),
+    JuraAlertBinarySensorDescription(
+        key="filter_alert",
+        translation_key="filter_alert",
+        name_pattern="filter alert",
+    ),
+    JuraAlertBinarySensorDescription(
+        key="cappu_rinse_alert",
+        translation_key="cappu_rinse_alert",
+        name_pattern="cappu rinse alert",
+    ),
+    JuraAlertBinarySensorDescription(
+        key="cappu_clean_alert",
+        translation_key="cappu_clean_alert",
+        name_pattern="cappu clean alert",
+    ),
+)
 
 
 async def async_setup_entry(
-    hass: HomeAssistant, config_entry: ConfigEntry, add_entities: AddEntitiesCallback
-):
-    device = hass.data[DOMAIN][config_entry.entry_id]
+    hass: HomeAssistant,
+    entry: JuraConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up the binary sensors of a machine."""
+    coordinator = entry.runtime_data
 
-    # Create connection sensor
-    entities: list = [JuraSensor(device, "connection")]
+    async_add_entities(
+        [
+            JuraConnectionBinarySensor(coordinator, "connection"),
+            *(
+                JuraAlertBinarySensor(coordinator, description)
+                for description in ALERT_SENSORS
+            ),
+        ]
+    )
 
-    # Create alert binary sensors
-    for alert_info in ALERT_SENSORS:
-        entities.append(JuraAlertBinarySensor(device, alert_info))
 
-    add_entities(entities)
+class JuraConnectionBinarySensor(JuraEntity, BinarySensorEntity):
+    """Binary sensor for the Bluetooth connection to the machine."""
 
-
-class JuraSensor(JuraEntity, BinarySensorEntity):
     _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
     _attr_entity_category = EntityCategory.DIAGNOSTIC
+    # change with every advertisement, not worth keeping in the database
+    _unrecorded_attributes = frozenset({"last_seen", "rssi"})
 
-    def internal_update(self):
+    @callback
+    @override
+    def _async_update_attrs(self) -> None:
         self._attr_is_on = self.device.connected
-        self._attr_extra_state_attributes = self.device.conn_info
-
-        if self.hass:
-            self._async_write_ha_state()
+        self._attr_extra_state_attributes = dict(self.device.conn_info)
 
 
-class JuraAlertBinarySensor(JuraEntity, BinarySensorEntity):
-    """Binary sensor for Jura alerts."""
+class JuraAlertBinarySensor(JuraCoordinatorEntity, BinarySensorEntity):
+    """Binary sensor for an alert of the machine."""
 
-    def __init__(self, device, alert_info: dict):
+    entity_description: JuraAlertBinarySensorDescription
+
+    _attr_device_class = BinarySensorDeviceClass.PROBLEM
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(
+        self,
+        coordinator: JuraCoordinator,
+        description: JuraAlertBinarySensorDescription,
+    ) -> None:
         """Initialize the sensor."""
-        # Store name pattern before calling super().__init__
-        self._name_pattern = alert_info["name_pattern"].lower()
+        super().__init__(coordinator, f"alert_{description.key}")
+        self.entity_description = description
 
-        super().__init__(device, f"alert_{alert_info['type']}")
+    @property
+    @override
+    def is_on(self) -> bool | None:
+        """Return True if an active alert matches the pattern."""
+        if (alerts := self.coordinator.data.alerts) is None:
+            return None
 
-        self._attr_name = f"{device.name} {alert_info['display_name']}"
-        self._attr_icon = alert_info["icon"]
-        self._attr_device_class = alert_info["device_class"]
-        self._attr_entity_category = alert_info["entity_category"]
-
-        # Register for updates on alerts
-        device.register_alert_update(self.internal_update)
-
-    def internal_update(self):
-        """Update the sensor state."""
-        # Check if any active alert's name contains our pattern
-        self._attr_is_on = any(
-            self._name_pattern in alert_name.lower()
-            for _, alert_name in self.device.active_alerts.items()
-        )
-
-        if self.hass:
-            self._async_write_ha_state()
+        pattern = self.entity_description.name_pattern
+        return any(pattern in name.lower() for name in alerts.values())

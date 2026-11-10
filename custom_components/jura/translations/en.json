@@ -1,11 +1,131 @@
 {
   "config": {
+    "abort": {
+      "already_configured": "Device is already configured",
+      "already_in_progress": "Configuration flow is already in progress",
+      "no_devices_found": "No JURA coffee machines found. Check that the machine is switched on, the Bluetooth dongle is plugged in and in range of a Bluetooth adapter or proxy.",
+      "not_supported": "Device not supported"
+    },
+    "flow_title": "{name}",
     "step": {
+      "bluetooth_confirm": {
+        "description": "Do you want to set up {name} ({address})?"
+      },
       "user": {
         "data": {
-          "mac": "MAC"
+          "mac": "Device"
+        },
+        "data_description": {
+          "mac": "The Bluetooth dongle (JURA Smart Connect) of the coffee machine."
         }
       }
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "cappu_clean_alert": {
+        "name": "Milk system cleaning needed"
+      },
+      "cappu_rinse_alert": {
+        "name": "Milk system rinse needed"
+      },
+      "cleaning_alert": {
+        "name": "Cleaning needed"
+      },
+      "connection": {
+        "name": "Connection"
+      },
+      "empty_grounds": {
+        "name": "Empty grounds"
+      },
+      "empty_tray": {
+        "name": "Empty tray"
+      },
+      "fill_water": {
+        "name": "Fill water"
+      },
+      "filter_alert": {
+        "name": "Filter change needed"
+      },
+      "insert_tray": {
+        "name": "Insert tray"
+      }
+    },
+    "button": {
+      "make": {
+        "name": "Make"
+      },
+      "refresh_stats": {
+        "name": "Refresh statistics"
+      }
+    },
+    "number": {
+      "bypass": {
+        "name": "Bypass"
+      },
+      "milk_amount": {
+        "name": "Milk amount"
+      },
+      "milk_break": {
+        "name": "Milk break"
+      },
+      "milk_foam_amount": {
+        "name": "Milk foam amount"
+      },
+      "water_amount": {
+        "name": "Water amount"
+      }
+    },
+    "select": {
+      "coffee_strength": {
+        "name": "Coffee strength"
+      },
+      "grinder_ratio": {
+        "name": "Grinder ratio"
+      },
+      "product": {
+        "name": "Product"
+      },
+      "temperature": {
+        "name": "Temperature"
+      }
+    },
+    "sensor": {
+      "alerts": {
+        "name": "Alerts",
+        "state": {
+          "alert": "Alert",
+          "ok": "OK"
+        }
+      },
+      "product_count": {
+        "name": "{product} count"
+      },
+      "total_products": {
+        "name": "Total products"
+      }
+    },
+    "switch": {
+      "connection": {
+        "name": "Connection"
+      }
+    }
+  },
+  "exceptions": {
+    "device_not_found": {
+      "message": "Could not find the JURA coffee machine with address {address}: {reason}"
+    },
+    "invalid_option": {
+      "message": "Option {option} is not available for the selected product."
+    },
+    "machine_not_identified": {
+      "message": "The JURA coffee machine with address {address} did not tell its model yet."
+    },
+    "no_product_selected": {
+      "message": "Select a product first."
+    },
+    "unsupported_model": {
+      "message": "JURA coffee machine model {model_id} is not supported."
     }
   }
 }
