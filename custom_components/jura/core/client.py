@@ -1,17 +1,32 @@
+"""Bluetooth client for JURA coffee machines (BlueFrog dongle)."""
+
+from __future__ import annotations
+
 import asyncio
+from collections.abc import Callable, Coroutine
 import logging
 import time
-from typing import Callable
+from typing import Any
 
-from bleak import BLEDevice, BleakClient, BleakError
+from bleak import BleakClient
+from bleak.backends.device import BLEDevice
+from bleak.exc import BleakError
 from bleak_retry_connector import establish_connection
 
 from . import encryption
 
 _LOGGER = logging.getLogger(__name__)
 
+# How long the connection is kept alive after the last request
 ACTIVE_TIME = 120
+# How long a command stays valid while waiting for the connection
 COMMAND_TIME = 15
+# Heartbeat interval: 10 is too late, 9 is ok
+HEARTBEAT_INTERVAL = 9
+# Pause between two connection attempts
+RECONNECT_INTERVAL = 1
+# How long a reader waits for the connection to come up
+CONNECT_TIMEOUT = 20
 
 
 class UUIDs:
@@ -29,130 +44,230 @@ class UUIDs:
     MACHINE_STATUS = "5a401524-ab2e-2548-c435-08c300000710"
 
 
+type TaskFactory = Callable[[Coroutine[Any, Any, None]], asyncio.Task[None]]
+
+
 class Client:
-    def __init__(self, device: BLEDevice, callback: Callable = None, key: int = None):
+    """Keep a connection to the machine open on demand and talk to it.
+
+    The connection is only held while somebody needs it: every request
+    extends the active window by ACTIVE_TIME seconds, after which the
+    connection is dropped again.
+    """
+
+    def __init__(
+        self,
+        device: BLEDevice,
+        callback: Callable[[bool], None] | None = None,
+        key: int | None = None,
+        create_task: TaskFactory | None = None,
+    ) -> None:
+        """Initialize the client."""
         self.device = device
         self.callback = callback
-        self.client: BleakClient | None = None
-        self.loop = asyncio.get_running_loop()
-
-        self.ping_future: asyncio.Future | None = None
-        self.ping_task: asyncio.Task | None = None
-        self.ping_time = 0
         self.key = key
-        self.send_data = None
-        self.send_time = 0
-        self.send_uuid = None
+        self.client: BleakClient | None = None
 
-    def ping(self):
-        self.ping_time = time.time() + ACTIVE_TIME
+        self._create_task = create_task
+        self._stopped = False
 
-        if not self.ping_task:
-            self.ping_task = self.loop.create_task(self._ping_loop())
+        self.ping_task: asyncio.Task[None] | None = None
+        self.ping_time: float = 0
 
-    def ping_cancel(self):
+        # Pending commands, the latest one wins for each characteristic. A
+        # statistics request must never replace a pending "start product".
+        self._pending: dict[str, tuple[bytes, float]] = {}
+
+        # Wakes the heartbeat loop before the heartbeat interval elapsed
+        self._wake = asyncio.Event()
+        self._connected = asyncio.Event()
+        # Serialize GATT operations: the ping loop and the readers share one link
+        self._gatt_lock = asyncio.Lock()
+
+    def ping(self) -> None:
+        """Request the connection and keep it open for ACTIVE_TIME seconds."""
+        if self._stopped:
+            return
+
+        self.ping_time = time.monotonic() + ACTIVE_TIME
+
+        if self.ping_task is None or self.ping_task.done():
+            coro = self._ping_loop()
+            if self._create_task is not None:
+                self.ping_task = self._create_task(coro)
+            else:
+                self.ping_task = asyncio.get_running_loop().create_task(coro)
+
+    def ping_cancel(self) -> None:
+        """Release the connection."""
         # stop ping time
         self.ping_time = 0
 
         # cancel ping sleep timer
-        if self.ping_future:
-            self.ping_future.cancel()
+        self._wake.set()
 
-    def send(self, data: bytes, uuid: str = UUIDs.START_PRODUCT):
+    def send(self, data: bytes, uuid: str = UUIDs.START_PRODUCT) -> None:
+        """Queue a command, it will be sent as soon as the machine is connected."""
+        if self._stopped:
+            return
+
         # if send loop active - we change sending data
-        self.send_time = time.time() + COMMAND_TIME
-        self.send_data = data
-        self.send_uuid = uuid
+        self._pending[uuid] = (bytes(data), time.monotonic() + COMMAND_TIME)
 
         # refresh ping time
         self.ping()
 
         # cancel ping sleep timer
-        if self.ping_future:
-            self.ping_future.cancel()
+        self._wake.set()
 
-    async def _ping_loop(self):
-        while time.time() < self.ping_time:
+    async def stop(self) -> None:
+        """Drop the connection and stop the ping loop for good."""
+        self._stopped = True
+        self.ping_time = 0
+        self._pending.clear()
+        self._wake.set()
+
+        if (task := self.ping_task) is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    def _set_connected(self, connected: bool) -> None:
+        if connected == self._connected.is_set():
+            return
+
+        if connected:
+            self._connected.set()
+        else:
+            self._connected.clear()
+
+        if self.callback:
             try:
-                self.client = await establish_connection(
-                    BleakClient, self.device, self.device.address
-                )
-                if self.callback:
-                    self.callback(True)
+                self.callback(connected)
+            except Exception:
+                _LOGGER.exception("Error in connection callback")
 
-                # heartbeat loop
-                while time.time() < self.ping_time:
-                    if self.send_data:
-                        if time.time() < self.send_time:
-                            await self.client.write_gatt_char(
-                                self.send_uuid,
-                                data=encrypt(self.send_data, self.key),
-                                response=True,
-                            )
-                        self.send_data = None
+    def _on_disconnected(self, _client: BleakClient) -> None:
+        """Handle a dropped link, called by bleak."""
+        _LOGGER.debug("%s: disconnected", self.device.address)
+        # cancel ping sleep timer, so the loop can reconnect at once
+        self._wake.set()
 
-                    # important dummy write to keep the connection
-                    # https://github.com/Jutta-Proto/protocol-bt-cpp?tab=readme-ov-file#heartbeat
-                    heartbeat = [0x00, 0x7F, 0x80]
-                    try:
-                        await self.client.write_gatt_char(
-                            UUIDs.P_MODE,
-                            data=encrypt(heartbeat, self.key),
-                            response=True,
+    async def _ping_loop(self) -> None:
+        try:
+            while time.monotonic() < self.ping_time:
+                try:
+                    self.client = await establish_connection(
+                        BleakClient,
+                        self.device,
+                        self.device.address,
+                        disconnected_callback=self._on_disconnected,
+                        ble_device_callback=lambda: self.device,
+                    )
+                    self._set_connected(True)
+
+                    await self._heartbeat_loop(self.client)
+                except TimeoutError as e:
+                    _LOGGER.debug("ping timeout", exc_info=e)
+                except BleakError as e:
+                    _LOGGER.debug("ping error", exc_info=e)
+                except Exception as e:
+                    _LOGGER.warning("ping error", exc_info=e)
+                finally:
+                    # also runs when the task is cancelled (unload or shutdown)
+                    await self._disconnect()
+
+                if time.monotonic() < self.ping_time:
+                    await asyncio.sleep(RECONNECT_INTERVAL)
+        finally:
+            self.ping_task = None
+
+    async def _heartbeat_loop(self, client: BleakClient) -> None:
+        while time.monotonic() < self.ping_time:
+            if not client.is_connected:
+                raise BleakError("Connection lost")
+
+            # clear before the pending commands are checked, so a command
+            # queued while we are busy below is never missed
+            self._wake.clear()
+
+            for uuid in list(self._pending):
+                command = self._pending[uuid]
+                data, expires = command
+                if time.monotonic() < expires:
+                    # if this fails the command is sent again after the
+                    # reconnect, as long as it is not expired
+                    async with self._gatt_lock:
+                        await client.write_gatt_char(
+                            uuid, data=encrypt(data, self.key), response=True
                         )
-                        _LOGGER.debug("heartbeat sent")
-                    except Exception as e:
-                        # we log as info as this is expected if the device is off
-                        _LOGGER.info("heartbeat error", exc_info=e)
+                # keep a newer command queued during the write
+                if self._pending.get(uuid) is command:
+                    del self._pending[uuid]
 
-                    self.ping_future = self.loop.create_future()
-                    # 10 is too late, 9 is ok
-                    self.loop.call_later(9, self.ping_future.cancel)
-                    try:
-                        await self.ping_future
-                    except asyncio.CancelledError:
-                        pass
+            # important dummy write to keep the connection
+            # https://github.com/Jutta-Proto/protocol-bt-cpp?tab=readme-ov-file#heartbeat
+            heartbeat = [0x00, 0x7F, 0x80]
+            try:
+                async with self._gatt_lock:
+                    await client.write_gatt_char(
+                        UUIDs.P_MODE,
+                        data=encrypt(heartbeat, self.key),
+                        response=True,
+                    )
+                _LOGGER.debug("heartbeat sent")
+            except Exception as e:
+                # we log as info as this is expected if the device is off
+                _LOGGER.info("heartbeat error", exc_info=e)
+
+            try:
+                async with asyncio.timeout(HEARTBEAT_INTERVAL):
+                    await self._wake.wait()
             except TimeoutError:
                 pass
-            except BleakError as e:
-                _LOGGER.debug("ping error", exc_info=e)
+
+    async def _disconnect(self) -> None:
+        client, self.client = self.client, None
+
+        if client is not None:
+            try:
+                await client.disconnect()
             except Exception as e:
-                _LOGGER.warning("ping error", exc_info=e)
+                _LOGGER.debug("disconnect error", exc_info=e)
 
-            if self.client:
-                try:
-                    await self.client.disconnect()
-                except Exception as e:
-                    _LOGGER.debug("disconnect error", exc_info=e)
-                self.client = None
+        self._set_connected(False)
 
-            if self.callback:
-                self.callback(False)
+    async def _wait_connected(self, timeout: float | None = None) -> bool:
+        """Wait for the ping loop to bring the connection up."""
+        if self.client is None and not self._stopped:
+            try:
+                async with asyncio.timeout(
+                    CONNECT_TIMEOUT if timeout is None else timeout
+                ):
+                    await self._connected.wait()
+            except TimeoutError:
+                pass
 
-            await asyncio.sleep(1)
+        return self.client is not None
 
-        self.ping_task = None
-
-    async def read(self, uuid: str, decrypt: bool = False):
+    async def read(self, uuid: str, decrypt: bool = False) -> bytes | None:
         """Read data from a characteristic."""
-        if not self.client:
-            _LOGGER.warning("Cannot read: No active client connection")
+        if not (client := self.client):
+            _LOGGER.debug("Cannot read: No active client connection")
             return None
 
         try:
-            data = await self.client.read_gatt_char(uuid)
-            if decrypt and self.key:
-                return encryption.encdec(list(data), self.key)
-            return data
-        except BleakError as e:
-            _LOGGER.info(f"Error reading from characteristic {uuid}", exc_info=e)
-            raise
+            async with self._gatt_lock:
+                data = await client.read_gatt_char(uuid)
         except Exception as e:
-            _LOGGER.info(f"Error reading from characteristic {uuid}", exc_info=e)
+            _LOGGER.info("Error reading from characteristic %s", uuid, exc_info=e)
             raise
 
+        if decrypt and self.key is not None:
+            return encryption.encdec(list(data), self.key)
+        return bytes(data)
+
     async def read_statistics_data(
-        self, timeout: int = 20, retries: int = 30
+        self, timeout: float | None = None, retries: int = 30
     ) -> bytes | None:
         """Read statistics data from the device."""
         _LOGGER.debug("Reading Jura statistics...")
@@ -163,25 +278,22 @@ class Client:
         self.send(bytes(command_bytes), uuid=UUIDs.STATS_COMMAND)
 
         # Wait for connection
-        if not self.client:
-            for _ in range(timeout):
-                if not self.client:
-                    await asyncio.sleep(1)
-                else:
-                    break
-            if not self.client:
-                _LOGGER.debug("Failed to establish connection")
-                return None
+        if not await self._wait_connected(timeout):
+            _LOGGER.debug("Failed to establish connection")
+            return None
 
         # Wait for statistics to be ready
         # https://github.com/Jutta-Proto/protocol-bt-cpp?tab=readme-ov-file#reading
         for _ in range(retries):
             status = await self.read(UUIDs.STATS_COMMAND)
-            if status and status[1] != 225:  # 225 means not ready
+            if status is None:
+                _LOGGER.debug("Connection lost while waiting for statistics")
+                return None
+            if len(status) > 1 and status[1] != 225:  # 225 means not ready
                 break
             await asyncio.sleep(0.8)
         else:
-            _LOGGER.error("Device not ready for statistics reading")
+            _LOGGER.warning("Device not ready for statistics reading")
             return None
 
         # Read statistics data
@@ -193,30 +305,21 @@ class Client:
         _LOGGER.debug("Reading Jura machine status...")
 
         # Wait for connection
-        if not self.client:
-            self.ping()
-            for _ in range(20):
-                if not self.client:
-                    await asyncio.sleep(1)
-                else:
-                    break
-            if not self.client:
-                _LOGGER.debug("Failed to establish connection")
-                return None
-
-        try:
-            data = await self.read(UUIDs.MACHINE_STATUS, decrypt=True)
-            if data:
-                _LOGGER.debug(f"Machine status data: {data}")
-                return data
-        except Exception as e:
-            _LOGGER.warning("Error reading machine status", exc_info=e)
+        self.ping()
+        if not await self._wait_connected():
+            _LOGGER.debug("Failed to establish connection")
             return None
+
+        data = await self.read(UUIDs.MACHINE_STATUS, decrypt=True)
+        if data:
+            _LOGGER.debug("Machine status data: %s", data.hex())
+            return data
 
         return None
 
 
-def encrypt(data: bytes | list, key: int) -> bytes:
+def encrypt(data: bytes | list[int], key: int) -> bytes:
+    """Put the key into the first byte and encrypt the data."""
     data = bytearray(data)
     data[0] = key
     return encryption.encdec(data, key)

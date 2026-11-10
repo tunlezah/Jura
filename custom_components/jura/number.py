@@ -1,34 +1,57 @@
-from homeassistant.components.number import NumberEntity
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+"""Number platform for the JURA Coffee Machines integration."""
 
-from . import DOMAIN
-from .core.entity import JuraEntity
+from __future__ import annotations
+
+from typing import override
+
+from homeassistant.components.number import NumberEntity
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import ServiceValidationError
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+
+from .const import DOMAIN
+from .coordinator import JuraConfigEntry
+from .entity import JuraEntity
+
+# The values are kept locally until the product is made
+PARALLEL_UPDATES = 0
 
 
 async def async_setup_entry(
-    hass: HomeAssistant, config_entry: ConfigEntry, add_entities: AddEntitiesCallback
+    hass: HomeAssistant,
+    entry: JuraConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    device = hass.data[DOMAIN][config_entry.entry_id]
+    """Set up the numbers of a machine."""
+    coordinator = entry.runtime_data
 
-    add_entities([JuraNumber(device, select) for select in device.numbers()])
+    async_add_entities(
+        JuraNumber(coordinator, attr) for attr in coordinator.device.numbers()
+    )
 
 
 class JuraNumber(JuraEntity, NumberEntity):
-    def internal_update(self):
+    """Number for a setting of the selected product."""
+
+    @callback
+    @override
+    def _async_update_attrs(self) -> None:
         attribute = self.device.attribute(self.attr)
 
         self._attr_available = "value" in attribute
         self._attr_native_min_value = attribute.get("min", 0)
         self._attr_native_max_value = attribute.get("max", 0)
-        self._attr_native_step = attribute.get("step")
+        self._attr_native_step = attribute.get("step", 1)
         self._attr_native_value = attribute.get("value")
 
-        if self.hass:
-            self._async_write_ha_state()
-
+    @override
     async def async_set_native_value(self, value: float) -> None:
-        self.device.set_value(self.attr, int(value))
-        self._attr_native_value = int(value)
-        self._async_write_ha_state()
+        """Set the value for the selected product."""
+        try:
+            self.device.set_value(self.attr, int(value))
+        except ValueError as err:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN, translation_key="no_product_selected"
+            ) from err
+
+        self._async_handle_update()

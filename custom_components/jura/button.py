@@ -1,61 +1,58 @@
-import logging
+"""Button platform for the JURA Coffee Machines integration."""
+
+from __future__ import annotations
+
+from typing import override
 
 from homeassistant.components.button import ButtonEntity
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .core import DOMAIN
-from .core.entity import JuraEntity
+from .coordinator import JuraConfigEntry
+from .entity import JuraEntity
 
-_LOGGER = logging.getLogger(__name__)
+# The commands are queued and sent by the connection of the machine. Making a
+# product must not wait for a statistics refresh.
+PARALLEL_UPDATES = 0
 
 
 async def async_setup_entry(
-    hass: HomeAssistant, config_entry: ConfigEntry, add_entities: AddEntitiesCallback
+    hass: HomeAssistant,
+    entry: JuraConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    device = hass.data[DOMAIN][config_entry.entry_id]
+    """Set up the buttons of a machine."""
+    coordinator = entry.runtime_data
 
-    add_entities(
+    async_add_entities(
         [
-            JuraMakeButton(device, "make"),
-            JuraRefreshStatsButton(device),
+            JuraMakeButton(coordinator, "make"),
+            JuraRefreshStatsButton(coordinator, "refresh_stats"),
         ]
     )
 
 
 class JuraMakeButton(JuraEntity, ButtonEntity):
-    def internal_update(self):
+    """Button to make the selected product."""
+
+    @callback
+    @override
+    def _async_update_attrs(self) -> None:
         self._attr_available = self.device.product is not None
 
-        if self.hass:
-            self._async_write_ha_state()
-
+    @override
     async def async_press(self) -> None:
+        """Make the selected product."""
         self.device.start_product()
 
 
 class JuraRefreshStatsButton(JuraEntity, ButtonEntity):
-    """Button to refresh statistics from the Jura machine."""
+    """Button to refresh the statistics and the alerts of the machine."""
 
-    def __init__(self, device):
-        super().__init__(device, "refresh_stats")
-        self._attr_icon = "mdi:refresh"
-        self._attr_name = f"{device.name} Refresh Statistics"
-        self._attr_entity_category = EntityCategory.DIAGNOSTIC
-        self._attr_available = True  # Always make the button available
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
 
-    def internal_update(self):
-        if self.hass:
-            self._async_write_ha_state()
-
+    @override
     async def async_press(self) -> None:
-        """Handle the button press."""
-        _LOGGER.info("Manually refreshing Jura statistics and alerts")
-        try:
-            await self.device.read_statistics(force_update=True)
-            await self.device.read_alerts()
-            _LOGGER.info("Successfully refreshed Jura statistics and alerts")
-        except Exception as e:
-            _LOGGER.error(f"Error refreshing Jura statistics: {e}")
+        """Read the statistics and the alerts from the machine."""
+        await self.coordinator.async_request_refresh()

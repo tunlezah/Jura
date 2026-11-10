@@ -1,37 +1,55 @@
+"""Switch platform for the JURA Coffee Machines integration."""
+
+from __future__ import annotations
+
 import asyncio
+from typing import Any, override
 
 from homeassistant.components.switch import SwitchEntity
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from . import DOMAIN
-from .core.entity import JuraEntity
+from .coordinator import JuraConfigEntry
+from .entity import JuraEntity
+
+# The switch only requests or releases the connection
+PARALLEL_UPDATES = 0
+
+# How long the switch waits for the connection to follow, in seconds
+CONNECTION_TIMEOUT = 5
 
 
 async def async_setup_entry(
-    hass: HomeAssistant, config_entry: ConfigEntry, add_entities: AddEntitiesCallback
-):
-    device = hass.data[DOMAIN][config_entry.entry_id]
+    hass: HomeAssistant,
+    entry: JuraConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up the switches of a machine."""
+    async_add_entities([JuraConnectionSwitch(entry.runtime_data, "connection")])
 
-    add_entities([JuraSwitch(device, "connection")])
 
+class JuraConnectionSwitch(JuraEntity, SwitchEntity):
+    """Switch to connect to the machine or to release the connection."""
 
-class JuraSwitch(JuraEntity, SwitchEntity):
-    def internal_update(self):
+    @callback
+    @override
+    def _async_update_attrs(self) -> None:
         self._attr_is_on = self.device.connected
 
-        if self.hass:
-            self._async_write_ha_state()
+    async def _async_wait_connected(self, connected: bool) -> None:
+        for _ in range(CONNECTION_TIMEOUT):
+            if self.device.connected == connected:
+                return
+            await asyncio.sleep(1)
 
-    async def async_turn_on(self) -> None:
+    @override
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        """Connect to the machine."""
         self.device.client.ping()
-        for _ in range(5):
-            if not self.device.connected:
-                await asyncio.sleep(1)
+        await self._async_wait_connected(True)
 
-    async def async_turn_off(self) -> None:
+    @override
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        """Release the connection to the machine."""
         self.device.client.ping_cancel()
-        for _ in range(5):
-            if self.device.connected:
-                await asyncio.sleep(1)
+        await self._async_wait_connected(False)

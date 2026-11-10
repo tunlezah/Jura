@@ -1,170 +1,124 @@
-"""Sensor platform for Jura integration."""
+"""Sensor platform for the JURA Coffee Machines integration."""
 
-import logging
-from datetime import timedelta
-from typing import Any
+from __future__ import annotations
+
+from typing import Any, override
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
     SensorStateClass,
 )
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .core import DOMAIN
-from .core.entity import JuraEntity
+from .coordinator import JuraConfigEntry, JuraCoordinator
+from .entity import JuraCoordinatorEntity
 
-_LOGGER = logging.getLogger(__name__)
+# Coordinator is used to centralize the data updates
+PARALLEL_UPDATES = 0
+
+# Alert bits which are not shown as alerts
+FILTERED_ALERT_BITS = frozenset({12, 13, 36, 37, 148, 149, 150, 151})
 
 
 async def async_setup_entry(
-    hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
+    hass: HomeAssistant,
+    entry: JuraConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Set up Jura sensor based on a config entry."""
-    device = hass.data[DOMAIN][entry.entry_id]
+    """Set up the sensors of a machine."""
+    coordinator = entry.runtime_data
 
     # Create the total coffees sensor
-    entities: list = [JuraTotalCoffeeSensor(device)]
+    entities: list[SensorEntity] = [JuraTotalCoffeeSensor(coordinator)]
 
     # Create sensors for each product
-    for product in device.products:
+    product_names: set[str] = set()
+    for product in coordinator.device.products:
         product_name = product["@Name"]
-        if product.get("@Active") != "false":
-            entities.append(JuraProductCountSensor(device, product_name))
+        if product.get("@Active") != "false" and product_name not in product_names:
+            product_names.add(product_name)
+            entities.append(JuraProductCountSensor(coordinator, product_name))
 
     # Create alert sensors
-    entities.append(JuraAlertSensor(device))
+    entities.append(JuraAlertSensor(coordinator))
 
     async_add_entities(entities)
 
-    # Set up automatic refresh
-    update_interval = hass.data[DOMAIN].get("update_interval", 60)
 
-    async def refresh_statistics(*_):
-        """Refresh statistics regularly."""
-        try:
-            await device.read_statistics()
-            await device.read_alerts()
-        except Exception as ex:
-            # we log as info as this is expected if the device is off
-            _LOGGER.info(f"Error refreshing statistics: {ex}")
-
-    # Schedule regular updates
-    entry.async_on_unload(
-        async_track_time_interval(
-            hass, refresh_statistics, timedelta(seconds=update_interval)
-        )
-    )
-
-    # Do an initial refresh
-    hass.async_create_task(refresh_statistics())
-
-
-class JuraStatisticsSensor(JuraEntity, SensorEntity):
-    """Base class for Jura statistics sensors."""
-
-    def __init__(self, device, attr: str):
-        """Initialize the sensor."""
-        super().__init__(device, attr)
-
-        # Register for updates on statistics
-        device.register_statistics_update(self.internal_update)
-
-    @property
-    def native_value(self) -> Any:
-        """Return the state of the sensor."""
-        return self._get_value()
-
-    def _get_value(self) -> Any:
-        """Get the value for this sensor from statistics."""
-        raise NotImplementedError("Subclasses must implement this method")
-
-    def internal_update(self):
-        """Override parent method to ensure statistics are refreshed."""
-        _LOGGER.debug(f"Updating sensor {self._attr_name}")
-        if self.hass is not None:
-            self.async_write_ha_state()
-
-
-class JuraTotalCoffeeSensor(JuraStatisticsSensor):
+class JuraTotalCoffeeSensor(JuraCoordinatorEntity, SensorEntity):
     """Sensor for total coffee count."""
 
-    _attr_icon = "mdi:coffee"
-    _attr_state_class = SensorStateClass.TOTAL_INCREASING
     _attr_native_unit_of_measurement = "products"
-
-    def __init__(self, device):
-        """Initialize the sensor."""
-        super().__init__(device, "total_product")
-        self._attr_name = f"{device.name} Total Products"
-
-    def _get_value(self) -> int:
-        """Get the total coffee count."""
-        value = self.device.statistics.get("total_products", 0)
-        _LOGGER.debug(f"Total coffee value: {value}")
-        return value
-
-
-class JuraProductCountSensor(JuraStatisticsSensor):
-    """Sensor for individual product count."""
-
-    _attr_icon = "mdi:coffee-outline"
     _attr_state_class = SensorStateClass.TOTAL_INCREASING
-    _attr_native_unit_of_measurement = "products"
+    _attr_translation_key = "total_products"
 
-    def __init__(self, device, product_name: str):
+    def __init__(self, coordinator: JuraCoordinator) -> None:
         """Initialize the sensor."""
-        self.product_name = product_name
-        attr_name = f"product_{product_name.lower().replace(' ', '_')}"
-        super().__init__(device, attr_name)
-        self._attr_name = f"{device.name} {product_name} Count"
-
-    def _get_value(self) -> int:
-        """Get the count for this specific product."""
-        value = self.device.statistics.get("product_counts", {}).get(
-            self.product_name, None
-        )
-        _LOGGER.debug(f"Product {self.product_name} count: {value}")
-        return value
-
-
-class JuraAlertSensor(JuraEntity, SensorEntity):
-    """Sensor for machine alerts."""
-
-    _attr_icon = "mdi:alert"
-    _attr_device_class = SensorDeviceClass.ENUM
-    _attr_options = ["ok", "alert"]
-
-    def __init__(self, device):
-        """Initialize the sensor."""
-        super().__init__(device, "alerts")
-        self._attr_name = f"{device.name} Alerts"
-        self._attr_extra_state_attributes = {"active_alerts": []}
-
-        # Register for updates on alerts
-        device.register_alert_update(self.internal_update)
+        super().__init__(coordinator, "total_product")
 
     @property
-    def native_value(self) -> str:
-        """Return the state of the sensor."""
-        return self._get_value()
+    @override
+    def native_value(self) -> int | None:
+        """Return the total count of the products."""
+        return self.coordinator.data.total_products
 
-    def _get_value(self) -> str:
-        """Get the alert status."""
-        active_alerts = []
-        # Filter out specific alert bits that we don't want to show
-        filtered_bits = {12, 13, 36, 37, 148, 149, 150, 151}
-        for bit, name in self.device.active_alerts.items():
-            if bit not in filtered_bits:
-                active_alerts.append({"bit": bit, "name": name})
-        self._attr_extra_state_attributes["active_alerts"] = active_alerts
+
+class JuraProductCountSensor(JuraCoordinatorEntity, SensorEntity):
+    """Sensor for individual product count."""
+
+    _attr_native_unit_of_measurement = "products"
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_translation_key = "product_count"
+
+    def __init__(self, coordinator: JuraCoordinator, product_name: str) -> None:
+        """Initialize the sensor."""
+        super().__init__(
+            coordinator, f"product_{product_name.lower().replace(' ', '_')}"
+        )
+        self.product_name = product_name
+        self._attr_translation_placeholders = {"product": product_name}
+
+    @property
+    @override
+    def native_value(self) -> int | None:
+        """Return the count of the product."""
+        return self.coordinator.data.product_counts.get(self.product_name)
+
+
+class JuraAlertSensor(JuraCoordinatorEntity, SensorEntity):
+    """Sensor for machine alerts."""
+
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = ["ok", "alert"]
+    _attr_translation_key = "alerts"
+
+    def __init__(self, coordinator: JuraCoordinator) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, "alerts")
+
+    @property
+    def _active_alerts(self) -> list[dict[str, Any]] | None:
+        if (alerts := self.coordinator.data.alerts) is None:
+            return None
+
+        return [
+            {"bit": bit, "name": name}
+            for bit, name in alerts.items()
+            if bit not in FILTERED_ALERT_BITS
+        ]
+
+    @property
+    @override
+    def native_value(self) -> str | None:
+        """Return the alert status."""
+        if (active_alerts := self._active_alerts) is None:
+            return None
         return "alert" if active_alerts else "ok"
 
-    def internal_update(self):
-        """Override parent method to ensure alerts are refreshed."""
-        _LOGGER.debug(f"Updating alert sensor {self._attr_name}")
-        if self.hass is not None:
-            self.async_write_ha_state()
+    @property
+    @override
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return the active alerts."""
+        return {"active_alerts": self._active_alerts or []}

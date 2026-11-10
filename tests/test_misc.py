@@ -1,18 +1,30 @@
-import asyncio
+"""Test the machine model and the encryption."""
 
-from bleak import BLEDevice
+from __future__ import annotations
 
-from custom_components.jura import get_machine
-from custom_components.jura.core.device import Device
+from unittest.mock import patch
+
+from bleak.backends.device import BLEDevice
+import pytest
+
+from custom_components.jura.core.device import (
+    Device,
+    EmptyModel,
+    UnsupportedModel,
+    get_machine,
+)
 from custom_components.jura.core.encryption import encdec
-from custom_components.jura.select import JuraSelect
+
+
+@pytest.fixture(autouse=True)
+def socket_enabled(socket_enabled: None) -> None:
+    """These tests don't need Home Assistant."""
 
 
 def make_device(adv: bytes) -> Device:
-    asyncio.get_running_loop = lambda: None
-
+    """Create the machine for the manufacturer data."""
     machine = get_machine(adv)
-    ble = BLEDevice("", None, None)
+    ble = BLEDevice("AA:BB:CC:DD:EE:FF", None, None)
     device = Device(
         "Jura",
         machine["model"],
@@ -21,6 +33,7 @@ def make_device(adv: bytes) -> Device:
         machine["key"],
         ble,
     )
+    # no connection in these tests
     device.client.ping = lambda *args: None
     return device
 
@@ -235,17 +248,176 @@ def test_device_x8c():
 def test_coffee_strength():
     device = make_device(b"*\x05\x08\x03\xfb;")
 
-    select = JuraSelect(device, "coffee_strength")
-    assert select.name == "Jura Coffee Strength"
-    assert select.available is False
-    assert select.current_option is None
-    assert select.options == ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]
+    # all the options of the machine are known before a product is selected
+    assert device.attribute("coffee_strength") == {
+        "options": ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]
+    }
 
     device.select_option("product", "Cafe Barista")
 
-    assert select.available is True
-    assert select.current_option == "6"
-    assert select.options == ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]
+    assert device.attribute("coffee_strength") == {
+        "default": "6",
+        "options": ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"],
+    }
+
+    # the selected option is kept until another product is selected
+    device.select_option("coffee_strength", "10")
+    assert device.attribute("coffee_strength")["default"] == "10"
+    device.set_value("water_amount", 50)
+    assert device.attribute("water_amount")["value"] == 50
+
+    device.select_option("product", "Espresso")
+    assert device.attribute("coffee_strength")["default"] == "8"
+    assert device.attribute("water_amount")["value"] == 45
+
+
+def test_default_is_not_an_option():
+    # the default temperature of this product isn't one of its options
+    device = make_device(b"*\x05\x08\x03" + (14000).to_bytes(2, "little"))
+    assert device.model.startswith("X6")
+
+    device.select_option("product", "2 Ristretti")
+
+    assert device.attribute("temperature") == {
+        "default": None,
+        "options": ["Normal", "High"],
+    }
+    assert len(device.command()) == 18
+
+
+def test_invalid_selection():
+    device = make_device(b"*\x05\x08\x03\xfb;")
+
+    with pytest.raises(ValueError):
+        device.select_option("product", "Tea")
+    with pytest.raises(ValueError):
+        device.set_value("water_amount", 50)
+    with pytest.raises(ValueError):
+        device.select_option("coffee_strength", "10")
+    with pytest.raises(ValueError):
+        device.command()
+
+    device.select_option("product", "Cafe Barista")
+    with pytest.raises(ValueError):
+        device.select_option("coffee_strength", "XStrong")
+    # this product has no milk
+    with pytest.raises(ValueError):
+        device.select_option("grinder_ratio", "50_50")
+
+
+def test_update_handlers():
+    device = make_device(b"*\x05\x08\x03\xfb;")
+    calls = []
+
+    remove_connect = device.register_update("connection", lambda: calls.append("c"))
+    remove_product = device.register_update("make", lambda: calls.append("p"))
+    device.register_update("make", lambda: 1 / 0)
+
+    device.set_connected(True)
+    device.set_connected(True)
+    assert calls == ["c"]
+
+    # a failing handler doesn't stop the others
+    device.select_option("product", "Espresso")
+    assert calls == ["c", "p"]
+
+    remove_connect()
+    remove_product()
+    remove_product()
+    device.set_connected(False)
+    device.select_option("product", "Coffee")
+    assert calls == ["c", "p"]
+
+
+def test_get_machine_errors():
+    with pytest.raises(EmptyModel):
+        get_machine(b"*\x05\x08\x03\x00\x00")
+    with pytest.raises(EmptyModel):
+        get_machine(b"")
+    with pytest.raises(EmptyModel):
+        get_machine(b"*\x05\x08")
+
+    # 1358 and 20 are the beginning of other lines of the machines list
+    for model_id in (1, 20, 1358, 65535):
+        with pytest.raises(UnsupportedModel):
+            get_machine(b"*\x05\x08\x03" + model_id.to_bytes(2, "little"))
+
+
+def test_all_machines():
+    """Test that every machine of the resources can be loaded."""
+    from pathlib import Path
+    from zipfile import ZipFile
+
+    import custom_components.jura.core.device as device_module
+
+    path = Path(device_module.__file__).parent / "resources.zip"
+    with ZipFile(path) as f:
+        lines = f.read("JOE_MACHINES.TXT").decode().splitlines()[1:]
+
+    model_ids = [int(line.split(";")[0]) for line in lines if line.strip()]
+    assert len(model_ids) > 500
+
+    for model_id in model_ids:
+        device = make_device(b"*\x05\x08\x03" + model_id.to_bytes(2, "little"))
+        assert device.model
+        assert device.products
+        assert "product" in device.selects()
+
+        # the command of every product can be built
+        for product in device.attribute("product")["options"]:
+            device.select_option("product", product)
+            assert len(device.command()) == 18
+            for attr in device.selects()[1:]:
+                attribute = device.attribute(attr)
+                if "default" in attribute:
+                    # the default of some products (X6) isn't an option
+                    assert attribute["default"] in [None, *attribute["options"]]
+            for attr in device.numbers():
+                attribute = device.attribute(attr)
+                if "value" in attribute:
+                    assert attribute["min"] <= attribute["value"] <= attribute["max"]
+
+
+async def test_read_statistics():
+    device = make_device(b"*\x05\x08\x03\xfb;")
+
+    data = bytearray()
+    for count in (1234, 0xFFFF, 200, 300):
+        data += count.to_bytes(3, "big")
+    # an incomplete last value is ignored
+    data += b"\x01"
+
+    with patch.object(device.client, "read_statistics_data", return_value=bytes(data)):
+        assert await device.read_statistics() == {
+            "total_products": 1234,
+            "product_counts": {"Espresso": 200, "Coffee": 300},
+        }
+
+    # empty, zero or implausible data keeps the last statistics
+    for data in (None, b"", b"\x00\x00\x00", b"\xff\xff\xff", b"\x01"):
+        with patch.object(device.client, "read_statistics_data", return_value=data):
+            assert (await device.read_statistics())["total_products"] == 1234
+
+
+async def test_read_alerts():
+    device = make_device(b"*\x05\x08\x03\xfb;")
+    assert device.active_alerts is None
+
+    with patch.object(device.client, "read_machine_status", return_value=None):
+        assert await device.read_alerts() is None
+
+    # no bottom tray, see test_status_key2A
+    data = bytes.fromhex("2a88000000040008000000000000000000000006")
+    with patch.object(device.client, "read_machine_status", return_value=data):
+        alerts = await device.read_alerts()
+    assert alerts[0] == "insert tray"
+    assert alerts[4] == "insert coffee bin"
+    assert alerts[37] == "active RF filter"
+    assert alerts[52] == "unknown alert 52"
+
+    # the last alerts are kept while the machine can't be read
+    with patch.object(device.client, "read_machine_status", return_value=None):
+        assert await device.read_alerts() == alerts
 
 
 def test_encdec():

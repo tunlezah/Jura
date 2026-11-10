@@ -1,0 +1,49 @@
+{
+  "entity": {
+    "binary_sensor": {
+      "cappu_clean_alert": {
+        "default": "mdi:cup-water"
+      },
+      "cappu_rinse_alert": {
+        "default": "mdi:cup-water"
+      },
+      "cleaning_alert": {
+        "default": "mdi:washing-machine"
+      },
+      "empty_grounds": {
+        "default": "mdi:delete"
+      },
+      "empty_tray": {
+        "default": "mdi:tray-alert"
+      },
+      "fill_water": {
+        "default": "mdi:water"
+      },
+      "filter_alert": {
+        "default": "mdi:air-filter"
+      },
+      "insert_tray": {
+        "default": "mdi:tray"
+      }
+    },
+    "button": {
+      "make": {
+        "default": "mdi:coffee-maker"
+      },
+      "refresh_stats": {
+        "default": "mdi:refresh"
+      }
+    },
+    "sensor": {
+      "alerts": {
+        "default": "mdi:alert"
+      },
+      "product_count": {
+        "default": "mdi:coffee-outline"
+      },
+      "total_products": {
+        "default": "mdi:coffee"
+      }
+    }
+  }
+}

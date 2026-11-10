@@ -1,3 +1,5 @@
+"""Tests for the JURA Coffee Machines integration."""
+
 from platform import system
 
 if system() == "Windows":

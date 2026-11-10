@@ -26,13 +26,37 @@ Or manually copy `jura` folder from [latest release](https://github.com/AlexxIT/
 
 [![](https://my.home-assistant.io/badges/config_flow_start.svg)](https://my.home-assistant.io/redirect/config_flow_start/?domain=jura)
 
-1. Add default [Bluetooth](https://www.home-assistant.io/integrations/bluetooth/) integration. 
+1. Add default [Bluetooth](https://www.home-assistant.io/integrations/bluetooth/) integration.
 
-2. Configuration > [Integrations](https://my.home-assistant.io/redirect/integrations/) > Add Integration > [JURA Coffee Machines](https://my.home-assistant.io/redirect/config_flow_start/?domain=jura)
+2. Switch the coffee machine on. Home Assistant discovers it automatically and shows it under Settings > [Devices & services](https://my.home-assistant.io/redirect/integrations/). You can also add it by hand: Add Integration > [JURA Coffee Machines](https://my.home-assistant.io/redirect/config_flow_start/?domain=jura)
 
-*If you have no MAC address in the setup window, then your HA server can't currently discover any coffee machine nearby. Check that the machine is on, bluetooth is working correctly (can you connect using the JURA smartphone application) and close enough.*
+*If the setup says that no coffee machines were found, then your HA server can't currently discover any coffee machine nearby. Check that the machine is on, bluetooth is working correctly (can you connect using the JURA smartphone application) and close enough.*
 
 If the machine is discovered but the device is not added, please check that you don't have protected the machine with a PIN code. PIN codes are not currently supported.
+
+Requires Home Assistant 2026.11 or newer.
+
+## Entities
+
+- **Product**, **Coffee strength**, **Temperature**, **Water amount**, ... - select a product first, then its settings become available. Nothing is sent to the machine until you press **Make**.
+- **Make** - makes the selected product with the selected settings.
+- **Connection** (switch) - connects to the machine or releases the connection. The connection is opened on demand and kept for two minutes after the last request.
+- **Connection** (binary sensor) - shows if the machine is connected. The signal strength and the time of the last advertisement are attributes.
+- **Total products**, **... count** - counters read from the machine every minute. The last values are kept while the machine is switched off.
+- **Alerts**, **Fill water**, **Empty tray**, ... - status read from the machine every minute.
+- **Refresh statistics** - reads the counters and the status right now.
+
+## Development
+
+The tests run against a real Home Assistant core with a simulated coffee machine:
+
+```bash
+pip install -r requirements_test.txt
+```
+
+```bash
+pytest
+```
 
 ## Demo
 
